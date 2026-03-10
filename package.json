@@ -1,0 +1,21 @@
+{
+  "name": "hope-haven-backend",
+  "version": "1.0.0",
+  "description": "Hope Haven School Management System - Backend API",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "mysql2": "^3.6.5",
+    "cors": "^2.8.5",
+    "body-parser": "^1.20.2",
+    "dotenv": "^16.3.1"
+  },
+  "keywords": ["school", "management", "education", "api"],
+  "author": "Hope Haven School",
+  "license": "MIT"
+}
