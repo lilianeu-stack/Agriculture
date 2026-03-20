@@ -1,3 +1,4 @@
+
 import express from 'express';
 import mysql from 'mysql2/promise';
 import cors from 'cors';
@@ -19,7 +20,7 @@ app.use(express.static(__dirname));
 
 // Database connection configuration
 const dbConfig = {
-  host: '192.171.2.70',
+  host: '192.171.1.10',
   user: 'hikuser',
   password: 'Hope@2025!',
   database: 'agliculture_att',
@@ -44,6 +45,39 @@ const initDB = async () => {
   }
 };
 
+// ========== FAMILY FEES OVERVIEW ENDPOINT ==========
+app.get('/api/school-fees/families', async (req, res) => {
+  try {
+    // Query to get only real families (father-mother pairs who share at least one child)
+    const query = `
+      SELECT
+        CONCAT('F', COALESCE(father.ParentID, 'NULL'), '_M', COALESCE(mother.ParentID, 'NULL')) AS family_id,
+        father.ParentID AS father_id,
+        father.FullName AS father_name,
+        mother.ParentID AS mother_id,
+        mother.FullName AS mother_name,
+        COUNT(DISTINCT s.StudentID) AS kids_count,
+        COALESCE(SUM(CASE WHEN father.ParentID IS NOT NULL AND sfp.amount_paid IS NOT NULL AND spFather.ParentID = father.ParentID THEN sfp.amount_paid ELSE 0 END), 0) AS father_fee_credit,
+        COALESCE(SUM(CASE WHEN mother.ParentID IS NOT NULL AND sfp.amount_paid IS NOT NULL AND spMother.ParentID = mother.ParentID THEN sfp.amount_paid ELSE 0 END), 0) AS mother_fee_credit,
+        COALESCE(SUM(sfp.amount_paid), 0) AS total_fee_credit,
+        GROUP_CONCAT(DISTINCT CONCAT(s.Registration_Number, ' - ', s.FirstName, ' ', s.LastName, ' (', s.Class, ')') SEPARATOR ', ') AS children_combined
+      FROM Students s
+      LEFT JOIN StudentParent spFather ON spFather.StudentID = s.StudentID
+      LEFT JOIN Parents father ON father.ParentID = spFather.ParentID AND father.Gender = 'Male'
+      LEFT JOIN StudentParent spMother ON spMother.StudentID = s.StudentID
+      LEFT JOIN Parents mother ON mother.ParentID = spMother.ParentID AND mother.Gender = 'Female'
+      LEFT JOIN student_fee_payments sfp ON sfp.student_id = s.StudentID
+      GROUP BY father.ParentID, mother.ParentID
+      ORDER BY father.ParentID, mother.ParentID
+      LIMIT 100
+    `;
+    const families = await dbQuery(query);
+    res.json({ families });
+  } catch (err) {
+    console.error('Error fetching family fees:', err);
+    res.status(500).json({ error: 'Database error: ' + err.message });
+  }
+});
 // Create student_fee_payments table if not exists
 const createFeesTable = async () => {
   try {
@@ -245,18 +279,30 @@ app.get('/api/parents', async (req, res) => {
   try {
     const { search } = req.query;
     
-    let query = 'SELECT ParentID, FullName, PhoneNumber, Gender, NumberOfKids FROM Parents WHERE 1=1';
+    let query = `SELECT ParentID, FullName, PhoneNumber, 
+      CASE 
+        WHEN PhoneNumber IS NULL OR PhoneNumber = '' THEN ''
+        WHEN MomoVerify IS NOT NULL AND MomoVerify != '' THEN MomoVerify
+        ELSE ''
+      END AS MomoVerify,
+      Gender, NumberOfKids FROM Parents WHERE 1=1`;
     const params = [];
     
     if (search) {
-      query += ' AND (FullName LIKE ? OR PhoneNumber LIKE ?)';
+      query += ' AND (FullName LIKE ? OR PhoneNumber LIKE ? OR ParentID LIKE ?)';
       const searchTerm = `%${search}%`;
-      params.push(searchTerm, searchTerm);
+      params.push(searchTerm, searchTerm, searchTerm);
     }
     
     query += ' ORDER BY FullName';
     const parents = await dbQuery(query, params);
-    res.json(parents);
+    // Map Gender to Role for frontend
+    const parentsWithRole = parents.map(p => ({
+      ...p,
+      MomoVerify: p.MomoVerify || (p.PhoneNumber ? '' : ''),
+      Role: p.Gender === 'Male' ? 'Father' : p.Gender === 'Female' ? 'Mother' : ''
+    }));
+    res.json(parentsWithRole);
   } catch (err) {
     console.error('Error fetching parents:', err);
     res.status(500).json({ error: 'Database error' });
@@ -266,10 +312,10 @@ app.get('/api/parents', async (req, res) => {
 // Add new parent
 app.post('/api/parents', async (req, res) => {
   try {
-    const { FullName, PhoneNumber, Gender, NumberOfKids } = req.body;
+    const { FullName, PhoneNumber, MomoVerify, Gender, NumberOfKids } = req.body;
     const result = await dbRun(
-      'INSERT INTO Parents (FullName, PhoneNumber, Gender, NumberOfKids) VALUES (?, ?, ?, ?)',
-      [FullName, PhoneNumber, Gender, NumberOfKids]
+      'INSERT INTO Parents (FullName, PhoneNumber, MomoVerify, Gender, NumberOfKids) VALUES (?, ?, ?, ?, ?)',
+      [FullName, PhoneNumber, MomoVerify || '', Gender, NumberOfKids]
     );
     res.json({ 
       message: 'Parent added successfully', 
@@ -285,10 +331,10 @@ app.post('/api/parents', async (req, res) => {
 app.put('/api/parents/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { FullName, PhoneNumber, Gender, NumberOfKids } = req.body;
+    const { FullName, PhoneNumber, MomoVerify, Gender, NumberOfKids } = req.body;
     const result = await dbRun(
-      'UPDATE Parents SET FullName = ?, PhoneNumber = ?, Gender = ?, NumberOfKids = ? WHERE ParentID = ?',
-      [FullName, PhoneNumber, Gender, NumberOfKids, id]
+      'UPDATE Parents SET FullName = ?, PhoneNumber = ?, MomoVerify = ?, Gender = ?, NumberOfKids = ? WHERE ParentID = ?',
+      [FullName, PhoneNumber, MomoVerify || '', Gender, NumberOfKids, id]
     );
     
     if (result.changes === 0) {
@@ -369,6 +415,14 @@ app.get('/api/parents/:id', async (req, res) => {
       `;
 
       shifts = await dbQuery(shiftsQuery, [id]);
+      // Remove duplicate/invalid shifts (same parent, shift name, check-in, check-out)
+      const seen = new Set();
+      shifts = shifts.filter(shift => {
+        const key = `${id}_${shift.shift_name}_${shift.check_in_time}_${shift.check_out_time}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
     } catch (shiftError) {
       console.warn('Could not fetch shift data for parent:', shiftError.message);
       // Fallback: get basic attendance data from AccessLogs
@@ -570,6 +624,7 @@ app.get('/api/relations', async (req, res) => {
         s.Registration_Number,
         s.FirstName as StudentFirstName,
         s.LastName as StudentLastName,
+        s.Class as StudentClass,
         p.FullName as ParentFullName
       FROM StudentParent sp
       JOIN Students s ON sp.StudentID = s.StudentID
@@ -1866,12 +1921,14 @@ app.get('/api/parent-earnings/summary', async (req, res) => {
   try {
     const { startDate = '2025-10-01', endDate = '2025-10-31', shiftId, search = '' } = req.query;
 
-    let whereClause = 'WHERE v.AccessDate BETWEEN ? AND ?';
+    console.log(`📊 /api/parent-earnings/summary: ${startDate} to ${endDate}`);
+
+    let whereClause = 'WHERE DATE(al.AccessDateTime) BETWEEN ? AND ?';
     const params = [startDate, endDate];
     const normalizedSearch = String(search || '').trim();
 
     if (shiftId) {
-      whereClause += ' AND v.shift_id = ?';
+      whereClause += ' AND EXISTS (SELECT 1 FROM shifts WHERE shift_id = ?)';
       params.push(shiftId);
     }
 
@@ -1880,32 +1937,60 @@ app.get('/api/parent-earnings/summary', async (req, res) => {
       params.push(`%${normalizedSearch}%`, `%${normalizedSearch}%`);
     }
 
-    const query = `
+    let results = [];
+    let queryType = 'fallback';
+
+    // Use v_attendance_with_rates view for real money/fees and support startDate/endDate
+    // Only count the first check-in and last check-out per parent per day
+    const viewQuery = `
       SELECT
-        p.ParentID,
-        p.FullName,
-        p.PhoneNumber,
-        p.Gender,
-        p.NumberOfKids,
+        v.ParentID, p.FullName, p.PhoneNumber, p.Gender, p.NumberOfKids,
         COALESCE(SUM(v.money_earned_rwf), 0) as total_money,
         COALESCE(SUM(v.fee_earned_rwf), 0) as total_fees,
         COALESCE(SUM(v.money_earned_rwf + v.fee_earned_rwf), 0) as total_earnings,
         COUNT(DISTINCT v.AccessDate) as days_worked,
         COUNT(*) as shifts_completed,
         COALESCE(ROUND(SUM(v.money_earned_rwf + v.fee_earned_rwf) / NULLIF(COUNT(DISTINCT v.AccessDate), 0), 0), 0) as avg_earnings_per_day
-      FROM Parents p
-      LEFT JOIN v_attendance_with_rates v ON p.ParentID = v.ParentID
-      ${whereClause}
-      GROUP BY p.ParentID, p.FullName, p.PhoneNumber, p.Gender, p.NumberOfKids
-      HAVING total_earnings > 0
+      FROM (
+        SELECT * FROM v_attendance_with_rates v1
+        WHERE (v1.check_in_time, v1.ParentID, v1.AccessDate) IN (
+          SELECT MIN(v2.check_in_time), v2.ParentID, v2.AccessDate
+          FROM v_attendance_with_rates v2
+          WHERE v2.AccessDate BETWEEN ? AND ?
+            AND v2.check_in_time != v2.check_out_time
+            AND v2.device_type_for_calc IN ('money','fees')
+          GROUP BY v2.ParentID, v2.AccessDate
+        )
+        OR (v1.check_out_time, v1.ParentID, v1.AccessDate) IN (
+          SELECT MAX(v3.check_out_time), v3.ParentID, v3.AccessDate
+          FROM v_attendance_with_rates v3
+          WHERE v3.AccessDate BETWEEN ? AND ?
+            AND v3.check_in_time != v3.check_out_time
+            AND v3.device_type_for_calc IN ('money','fees')
+          GROUP BY v3.ParentID, v3.AccessDate
+        )
+      ) v
+      LEFT JOIN Parents p ON v.ParentID = p.ParentID
+      WHERE v.AccessDate BETWEEN ? AND ?
+      ${normalizedSearch ? 'AND (CAST(v.ParentID AS CHAR) LIKE ? OR p.FullName LIKE ?)' : ''}
+      GROUP BY v.ParentID, p.FullName, p.PhoneNumber, p.Gender, p.NumberOfKids
+      HAVING (
+        (COALESCE(SUM(v.money_earned_rwf), 0) > 0 AND COALESCE(SUM(v.fee_earned_rwf), 0) = 0)
+        OR
+        (COALESCE(SUM(v.money_earned_rwf), 0) = 0 AND COALESCE(SUM(v.fee_earned_rwf), 0) > 0)
+      )
       ORDER BY total_earnings DESC
     `;
+    const viewParams = [startDate, endDate, startDate, endDate, startDate, endDate];
+    if (normalizedSearch) viewParams.push(`%${normalizedSearch}%`, `%${normalizedSearch}%`);
+    results = await dbQuery(viewQuery, viewParams);
+    queryType = 'v_attendance_with_rates_first_last_only';
 
-    const results = await dbQuery(query, params);
+    console.log(`✅ Summary query success (${queryType}): ${results.length} parents`);
     res.json(results);
   } catch (err) {
-    console.error('Error fetching parent earnings summary:', err);
-    res.status(500).json({ error: 'Database error: ' + err.message });
+    console.error('❌ Critical error in parent-earnings/summary:', err);
+    res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
 
@@ -1981,29 +2066,38 @@ app.get('/api/parent-earnings/detailed', async (req, res) => {
         }
       });
     } else {
-      // If no parentId provided, return summary data for all parents
-      const parentsData = await dbQuery(`
+      // If the range is a single day, return daily breakdown for all parents
+      // Always return daily breakdown for all parents in the range
+      const earnings = await dbQuery(`
         SELECT
           p.ParentID,
           p.FullName,
-          COUNT(DISTINCT v.AccessDate) as days_worked,
-          COUNT(*) as shifts,
-          COALESCE(SUM(v.money_earned_rwf), 0) as total_money,
-          COALESCE(SUM(v.fee_earned_rwf), 0) as total_fees,
-          COALESCE(SUM(v.money_earned_rwf + v.fee_earned_rwf), 0) as grand_total
+          p.PhoneNumber,
+          p.MomoVerify,
+          DATE(al.AccessDateTime) as AccessDate,
+          COUNT(CASE WHEN al.DeviceName = 'Gukorera Amafaranga' OR al.DeviceName LIKE '%Money%' OR al.DeviceName = 'Gukorea Abana' OR al.DeviceName LIKE '%Fee%' OR al.DeviceName LIKE '%Abana%' THEN 1 END) as shifts,
+          COUNT(CASE WHEN al.DeviceName = 'Gukorera Amafaranga' OR al.DeviceName LIKE '%Money%' THEN 1 END) * 2500 as total_money,
+          COUNT(CASE WHEN al.DeviceName = 'Gukorea Abana' OR al.DeviceName LIKE '%Fee%' OR al.DeviceName LIKE '%Abana%' THEN 1 END) * 2000 as total_fees
         FROM Parents p
-        LEFT JOIN v_attendance_with_rates v ON p.ParentID = v.ParentID AND v.AccessDate BETWEEN ? AND ?
-        GROUP BY p.ParentID, p.FullName
-        HAVING grand_total > 0
-        ORDER BY grand_total DESC
+        LEFT JOIN AttendanceLog al ON p.ParentID = al.ParentID AND DATE(al.AccessDateTime) BETWEEN ? AND ?
+        GROUP BY p.ParentID, p.FullName, p.PhoneNumber, p.MomoVerify, DATE(al.AccessDateTime)
+        HAVING total_money > 0 OR total_fees > 0
+        ORDER BY AccessDate DESC, p.FullName
       `, [startDate, endDate]);
-
+      const data = earnings.map(row => ({
+        ...row,
+        total_earnings: Number(row.total_money || 0) + Number(row.total_fees || 0)
+      }));
+      if (data.length === 0) {
+        console.log('⚠️ No data for range - returning empty');
+        res.json({ data: [], summary: { total_rows: 0, total_earnings: 0, note: 'No earnings in date range' } });
+        return;
+      }
       res.json({
-        data: parentsData,
+        data: data,
         summary: {
-          total_parents: parentsData.length,
-          total_earnings: parentsData.reduce((sum, row) => sum + row.grand_total, 0),
-          total_shifts: parentsData.reduce((sum, row) => sum + row.shifts, 0)
+          total_rows: data.length,
+          total_earnings: data.reduce((sum, row) => sum + (row.total_earnings || 0), 0)
         }
       });
     }
@@ -2210,6 +2304,67 @@ app.get('/api/reports/shift-performance', async (req, res) => {
     res.json(results);
   } catch (err) {
     console.error('Error generating shift report:', err);
+    res.status(500).json({ error: 'Database error: ' + err.message });
+  }
+});
+
+// SHIFT WORKED REPORT - NEW ENDPOINT FOR Reports.jsx
+app.get('/api/reports/shift-worked', async (req, res) => {
+  try {
+    const { startDate = '2025-10-01', endDate = '2025-10-31' } = req.query;
+
+    // Primary query using v_attendance_with_rates view (matches existing report patterns)
+    let query = `
+      SELECT 
+        COALESCE(v.shift_name, 'Unknown') as shift_name,
+        v.ParentID,
+        COALESCE(p.FullName, 'Unknown') as FullName,
+        v.check_in_time,
+        v.check_out_time,
+        v.device_type_for_calc,
+        CASE 
+          WHEN v.check_out_time IS NOT NULL AND v.check_in_time IS NOT NULL THEN true 
+          ELSE false 
+        END as valid
+      FROM v_attendance_with_rates v
+      LEFT JOIN Parents p ON v.ParentID = p.ParentID
+      WHERE DATE(v.AccessDate) BETWEEN ? AND ?
+      ORDER BY v.AccessDate DESC, v.check_in_time DESC
+    `;
+
+    let results;
+    try {
+      [results] = await db.execute(query, [startDate, endDate]);
+    } catch (viewError) {
+      console.warn('v_attendance_with_rates view unavailable, using AccessLogs fallback:', viewError.message);
+      
+      // Fallback query using AccessLogs + shifts (matches frontend expectations)
+      query = `
+        SELECT 
+          COALESCE(s.shift_name, 'Morning Shift') as shift_name,
+          al.ParentID,
+          COALESCE(p.FullName, al.PersonName, 'Unknown') as FullName,
+          TIME(al.AccessDateTime) as check_in_time,
+          NULL as check_out_time,
+          CASE
+            WHEN al.DeviceName LIKE '%Money%' OR al.DeviceName = 'Gukorera Amafaranga' THEN 'money'
+            WHEN al.DeviceName LIKE '%Fee%' OR al.DeviceName LIKE '%Abana%' OR al.DeviceName = 'Gukorea Abana' THEN 'fees'
+            ELSE 'other'
+          END as device_type_for_calc,
+          CASE WHEN al.AuthenticationResult LIKE '%Pass%' OR al.AuthenticationResult LIKE '%HumanDetect%' THEN true ELSE false END as valid
+        FROM AccessLogs al
+        LEFT JOIN Parents p ON al.ParentID = p.ParentID
+        LEFT JOIN shifts s ON 1=1  -- Simplified shift matching
+        WHERE DATE(al.AccessDateTime) BETWEEN ? AND ?
+        ORDER BY al.AccessDateTime DESC
+      `;
+      [results] = await db.execute(query, [startDate, endDate]);
+    }
+
+    console.log(`📊 /api/reports/shift-worked: Returned ${results.length} records for ${startDate} to ${endDate}`);
+    res.json(results);
+  } catch (err) {
+    console.error('Error in /api/reports/shift-worked:', err);
     res.status(500).json({ error: 'Database error: ' + err.message });
   }
 });
@@ -2651,122 +2806,147 @@ app.get('/api/money-shifts', async (req, res) => {
   }
 });
 
-// Get money shift earnings calculation
+// Get money shift earnings calculation - FIXED for Shifts.jsx/MoneyShifts.jsx
 app.get('/api/money-shifts/earnings', async (req, res) => {
   try {
     const { 
-      startDate = '2025-10-01', 
-      endDate = '2025-10-31',
-      parentId,
-      deviceType,
+      startDate = new Date().getFullYear() + '-' + String(new Date().getMonth() + 1).padStart(2, '0') + '-01',
+      endDate = new Date().getFullYear() + '-' + String(new Date().getMonth() + 1).padStart(2, '0') + '-' + new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0).getDate(),
       search = ''
     } = req.query;
 
-    let whereClause = "WHERE v.AccessDate BETWEEN ? AND ?";
-    const params = [startDate, endDate];
+    console.log(`📊 Money shifts earnings query: ${startDate} to ${endDate}, search: "${search}"`);
+
     const effectiveSearch = String(search || '').trim();
 
-    if (parentId) {
-      whereClause += " AND v.ParentID = ?";
-      params.push(parentId);
-    }
+
+    // Use AttendanceLog table for shift data
+    let whereClause = 'WHERE DATE(al.AccessDateTime) BETWEEN ? AND ?';
+    const params = [startDate, endDate];
 
     if (effectiveSearch) {
-      whereClause += " AND (CAST(v.ParentID AS CHAR) LIKE ? OR p.FullName LIKE ?)";
-      const term = `%${effectiveSearch}%`;
-      params.push(term, term);
+      whereClause += ' AND (CAST(al.ParentID AS CHAR) LIKE ? OR p.FullName LIKE ? OR al.PersonName LIKE ?)';
+      params.push(`%${effectiveSearch}%`, `%${effectiveSearch}%`, `%${effectiveSearch}%`);
     }
 
-    if (deviceType === 'money') {
-      whereClause += " AND v.device_type_for_calc = 'money'";
-    } else if (deviceType === 'fees') {
-      whereClause += " AND v.device_type_for_calc = 'fees'";
-    }
-
-    // Use the existing v_attendance_with_rates view which already has earnings calculations
-    const query = `
+    const recordsQuery = `
       SELECT
-        v.ParentID,
-        p.FullName,
-        v.AccessDate,
-        v.shift_name,
-        v.check_in_time,
-        v.check_out_time,
-        v.device_type_for_calc,
-        v.is_special_shift,
-        v.money_rate_rwf,
-        v.fee_rate_rwf,
-        v.money_rate_rwf_special,
-        COALESCE(pr.MoneyRateOverrideRWF, 0) as custom_rate,
-        v.money_earned_rwf,
-        v.fee_earned_rwf,
-        (v.money_earned_rwf + v.fee_earned_rwf) as total_earned,
-        CASE 
-          WHEN v.is_special_shift = 1 THEN v.money_rate_rwf_special
-          WHEN pr.MoneyRateOverrideRWF IS NOT NULL THEN pr.MoneyRateOverrideRWF
-          ELSE v.money_rate_rwf
-        END as applied_rate
-      FROM v_attendance_with_rates v
-      JOIN Parents p ON v.ParentID = p.ParentID
-      LEFT JOIN parent_rates pr ON v.ParentID = pr.ParentID
+        al.ParentID,
+        COALESCE(p.FullName, al.PersonName, 'Unknown') as FullName,
+        DATE(al.AccessDateTime) as AccessDate,
+        'Money Shift' as shift_name,  -- Can enhance with shifts table join if needed
+        TIME(al.AccessDateTime) as check_in_time,
+        TIME(al.AccessDateTime) as check_out_time,  -- Simplified; real check-out needs shift matching
+        CASE
+          WHEN al.DeviceName = 'Gukorera Amafaranga' OR al.DeviceName LIKE '%Money%' THEN 'money'
+          WHEN al.DeviceName = 'Gukorea Abana' OR al.DeviceName LIKE '%Fee%' OR al.DeviceName LIKE '%Abana%' THEN 'fees'
+          ELSE 'other'
+        END as device_type_for_calc,
+        CASE
+          WHEN al.DeviceName = 'Gukorera Amafaranga' OR al.DeviceName LIKE '%Money%' THEN 2500
+          ELSE 0
+        END as money_earned_rwf,
+        CASE
+          WHEN al.DeviceName = 'Gukorea Abana' OR al.DeviceName LIKE '%Fee%' OR al.DeviceName LIKE '%Abana%' THEN 2000
+          ELSE 0
+        END as fee_earned_rwf,
+        CASE
+          WHEN al.DeviceName = 'Gukorera Amafaranga' OR al.DeviceName LIKE '%Money%' THEN 2500
+          WHEN al.DeviceName = 'Gukorea Abana' OR al.DeviceName LIKE '%Fee%' OR al.DeviceName LIKE '%Abana%' THEN 2000
+          ELSE 0
+        END as total_earned,
+        CASE
+          WHEN al.DeviceName = 'Gukorera Amafaranga' OR al.DeviceName LIKE '%Money%' THEN 2500
+          WHEN al.DeviceName = 'Gukorea Abana' OR al.DeviceName LIKE '%Fee%' OR al.DeviceName LIKE '%Abana%' THEN 2000
+          ELSE 2500  -- Default money rate
+        END as applied_rate,
+        al.DeviceName,
+        al.AuthenticationResult
+      FROM AttendanceLog al
+      LEFT JOIN Parents p ON al.ParentID = p.ParentID
       ${whereClause}
-      ORDER BY v.AccessDate DESC, v.shift_name
+      HAVING total_earned > 0  -- Only shifts with earnings
+      ORDER BY AccessDate DESC, check_in_time
     `;
 
-    const results = await dbQuery(query, params);
+    // Execute the query and get detailedEarnings
+    const [detailedEarnings] = await db.query(recordsQuery, params);
 
-    // Calculate totals
-    const totals = results.reduce((acc, row) => {
-      acc.totalMoney += row.money_earned_rwf || 0;
-      acc.totalFees += row.fee_earned_rwf || 0;
-      acc.totalEarnings += row.total_earned || 0;
-      acc.totalShifts += 1;
+    // Mark valid shifts (e.g., duplicate check-in/out for same parent, date, and device_type_for_calc)
+    const validShiftMap = {};
+    detailedEarnings.forEach(row => {
+      const key = `${row.ParentID}|${row.AccessDate}|${row.device_type_for_calc}`;
+      if (!validShiftMap[key]) validShiftMap[key] = [];
+      validShiftMap[key].push(row);
+    });
+
+    // Mark valid: true if duplicate, false if unique
+    const detailedEarningsWithValid = detailedEarnings.map(row => {
+      const key = `${row.ParentID}|${row.AccessDate}|${row.device_type_for_calc}`;
+      return {
+        ...row,
+        valid: validShiftMap[key].length > 1
+      };
+    });
+
+    // Only calculate earnings for non-valid shifts
+    const totals = detailedEarningsWithValid.reduce((acc, row) => {
+      if (!row.valid) {
+        acc.totalMoney += Number(row.money_earned_rwf || 0);
+        acc.totalFees += Number(row.fee_earned_rwf || 0);
+        acc.totalEarnings += Number(row.total_earned || 0);
+      }
       return acc;
-    }, { totalMoney: 0, totalFees: 0, totalEarnings: 0, totalShifts: 0 });
+    }, { totalMoney: 0, totalFees: 0, totalEarnings: 0 });
 
-    // Group by parent for summary
+    // Group by parent for summary (matching MoneyShifts.jsx)
     const parentSummary = {};
-    results.forEach(row => {
-      if (!parentSummary[row.ParentID]) {
-        parentSummary[row.ParentID] = {
-          ParentID: row.ParentID,
+    detailedEarningsWithValid.forEach(row => {
+      const pid = row.ParentID;
+      if (!parentSummary[pid]) {
+        parentSummary[pid] = {
+          ParentID: pid,
           FullName: row.FullName,
           totalMoney: 0,
           totalFees: 0,
           totalEarnings: 0,
           shiftsCount: 0,
+          validShifts: 0,
           daysWorked: new Set()
         };
       }
-      parentSummary[row.ParentID].totalMoney += row.money_earned_rwf || 0;
-      parentSummary[row.ParentID].totalFees += row.fee_earned_rwf || 0;
-      parentSummary[row.ParentID].totalEarnings += row.total_earned || 0;
-      parentSummary[row.ParentID].shiftsCount += 1;
-      parentSummary[row.ParentID].daysWorked.add(row.AccessDate);
+      if (!row.valid) {
+        parentSummary[pid].totalMoney += Number(row.money_earned_rwf || 0);
+        parentSummary[pid].totalFees += Number(row.fee_earned_rwf || 0);
+        parentSummary[pid].totalEarnings += Number(row.total_earned || 0);
+        parentSummary[pid].shiftsCount += 1;
+        parentSummary[pid].daysWorked.add(row.AccessDate);
+      } else {
+        parentSummary[pid].validShifts += 1;
+      }
     });
 
-    // Convert parent summary to array
     const parentSummaryArray = Object.values(parentSummary).map(ps => ({
       ...ps,
       daysWorked: ps.daysWorked.size
     }));
 
-    res.json({
-      detailedEarnings: results,
+    const response = {
+      detailedEarnings: detailedEarningsWithValid,
       parentSummary: parentSummaryArray,
-      totals: totals,
-      summary: {
-        totalParents: parentSummaryArray.length,
-        totalShifts: totals.totalShifts,
-        averagePerShift: totals.totalShifts > 0 ? Math.round(totals.totalEarnings / totals.totalShifts) : 0,
-        averagePerParent: parentSummaryArray.length > 0 ? Math.round(totals.totalEarnings / parentSummaryArray.length) : 0
-      }
-    });
+      totals
+    };
+
+    console.log(`✅ Earnings response: ${detailedEarningsWithValid.length} records, ${parentSummaryArray.length} parents, totals: ${JSON.stringify(totals)}`);
+
+    res.json(response);
+
   } catch (err) {
-    console.error('Error fetching money shift earnings:', err);
-    res.status(500).json({ error: 'Database error: ' + err.message });
+    console.error('❌ Error in /api/money-shifts/earnings:', err);
+    res.status(500).json({ error: 'Server error: ' + err.message });
   }
 });
+
 
 // ========== FEES MANAGEMENT ENDPOINTS ==========
 
