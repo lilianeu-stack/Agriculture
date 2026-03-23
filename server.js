@@ -2409,19 +2409,17 @@ app.get('/api/reports/parent-performance', async (req, res) => {
 
 app.get('/api/dashboard/stats', async (req, res) => {
   try {
-    const latestDataDate = await dbGet(`
-      SELECT MAX(AccessDate) as max_date
-      FROM v_attendance_with_rates
-    `);
+    // Use selected date range from query string, fallback to current month if not provided
+    let { startDate, endDate } = req.query;
+    if (!startDate || !endDate) {
+      const today = new Date();
+      const refYear = today.getFullYear();
+      const refMonth = today.getMonth() + 1;
+      startDate = `${refYear}-${String(refMonth).padStart(2, '0')}-01`;
+      const monthEndDate = new Date(refYear, refMonth, 0);
+      endDate = `${refYear}-${String(refMonth).padStart(2, '0')}-${String(monthEndDate.getDate()).padStart(2, '0')}`;
+    }
 
-    const referenceDate = latestDataDate?.max_date ? new Date(latestDataDate.max_date) : new Date();
-    const refYear = referenceDate.getFullYear();
-    const refMonth = referenceDate.getMonth() + 1;
-
-    const monthStart = `${refYear}-${String(refMonth).padStart(2, '0')}-01`;
-    const monthEndDate = new Date(refYear, refMonth, 0);
-    const monthEnd = `${refYear}-${String(refMonth).padStart(2, '0')}-${String(monthEndDate.getDate()).padStart(2, '0')}`;
-    
     const [
       totalParents,
       totalStudents,
@@ -2436,28 +2434,29 @@ app.get('/api/dashboard/stats', async (req, res) => {
         SELECT COUNT(DISTINCT ParentID) as count
         FROM v_attendance_with_rates
         WHERE AccessDate BETWEEN ? AND ?
-      `, [monthStart, monthEnd]),
+      `, [startDate, endDate]),
       dbGet('SELECT COUNT(*) as count FROM shifts WHERE status = 1'),
       dbGet(`
         SELECT COALESCE(SUM(money_earned_rwf + fee_earned_rwf), 0) as total 
         FROM v_attendance_with_rates 
         WHERE AccessDate BETWEEN ? AND ?
-      `, [monthStart, monthEnd]),
+      `, [startDate, endDate]),
       dbGet('SELECT COUNT(*) as active FROM devices WHERE status = 1')
     ]);
-    
-    // Get monthly earnings trend (daily points within selected month)
+
+    // Get earnings trend (daily points within selected range), split by money and fees
     const monthlyTrend = await dbQuery(`
       SELECT 
         DATE(AccessDate) as date,
-        COALESCE(SUM(money_earned_rwf + fee_earned_rwf), 0) as daily_earnings
+        COALESCE(SUM(money_earned_rwf), 0) as money_earned,
+        COALESCE(SUM(fee_earned_rwf), 0) as fee_earned
       FROM v_attendance_with_rates 
       WHERE AccessDate BETWEEN ? AND ?
       GROUP BY DATE(AccessDate)
       ORDER BY date
-    `, [monthStart, monthEnd]);
-    
-    // Get top earning parents for selected month
+    `, [startDate, endDate]);
+
+    // Get top earning parents for selected range
     const topEarnersMonth = await dbQuery(`
       SELECT 
         p.FullName,
@@ -2468,8 +2467,8 @@ app.get('/api/dashboard/stats', async (req, res) => {
       GROUP BY p.ParentID, p.FullName
       ORDER BY month_earnings DESC
       LIMIT 5
-    `, [monthStart, monthEnd]);
-    
+    `, [startDate, endDate]);
+
     res.json({
       totalParents: totalParents?.count || 0,
       totalStudents: totalStudents?.count || 0,
@@ -2478,10 +2477,8 @@ app.get('/api/dashboard/stats', async (req, res) => {
       todayEarnings: monthEarnings?.total || 0,
       activeDevices: deviceStatus?.active || 0,
       monthlyRange: {
-        startDate: monthStart,
-        endDate: monthEnd,
-        year: refYear,
-        month: refMonth
+        startDate,
+        endDate
       },
       monthAttendance: monthAttendance?.count || 0,
       monthEarnings: monthEarnings?.total || 0,
